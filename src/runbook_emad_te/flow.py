@@ -275,7 +275,7 @@ def build_graph(params: dict):
     g.add_edge("max_iterations_fallback", "extract_response")
     g.add_edge("extract_response", END)
 
-    from langgraph.checkpoint.memory import MemorySaver
+    # Persistent conversation state via PostgresSaver
+    from app.checkpointer import get_checkpointer
 
-    # TODO: Switch to PostgresSaver for production persistence
-    return g.compile(checkpointer=MemorySaver())
+    return g.compile(checkpointer=get_checkpointer())
