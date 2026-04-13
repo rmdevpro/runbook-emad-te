@@ -99,11 +99,15 @@ def build_graph(params: dict):
     """
 
     async def init_node(state: RunbookState) -> dict:
-        """Parse payload, load eMAD config, assemble system prompt."""
+        """Parse payload, set up conversation.
+
+        Resumed turns (checkpointer loaded prior messages): only append new user message.
+        First turn: build full message list with system prompt.
+        """
         payload = state.get("payload", {})
         model_name = payload.get("model", "unknown")
+        existing_messages = state.get("messages", [])
 
-        # Load this eMAD's config
         emad_config = _load_emad_config(model_name)
 
         # Resolve conversation_id
@@ -113,30 +117,33 @@ def build_graph(params: dict):
         elif not conv_id:
             conv_id = f"default-{model_name}"
 
-        # Parse messages
+        # Extract the last user message from payload
         raw_messages = payload.get("messages", [])
-        lc_messages = []
-        for m in raw_messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if role == "system":
-                lc_messages.append(SystemMessage(content=content))
-            elif role == "assistant":
-                lc_messages.append(AIMessage(content=content))
-            elif role == "tool":
-                lc_messages.append(ToolMessage(content=content, tool_call_id=m.get("tool_call_id", "unknown")))
-            else:
-                lc_messages.append(HumanMessage(content=content))
+        new_user_msg = None
+        for m in reversed(raw_messages):
+            if m.get("role") == "user":
+                new_user_msg = HumanMessage(content=m.get("content", ""))
+                break
+        if not new_user_msg:
+            new_user_msg = HumanMessage(content="")
 
-        # Assemble and prepend system prompt
-        has_system = any(isinstance(m, SystemMessage) for m in lc_messages)
-        if not has_system:
-            system_prompt = _assemble_system_prompt(emad_config, model_name)
-            if system_prompt:
-                lc_messages = [SystemMessage(content=system_prompt)] + lc_messages
+        # Resumed conversation
+        if existing_messages:
+            return {
+                "messages": [new_user_msg],
+                "conversation_id": conv_id,
+                "iteration_count": 0,
+            }
+
+        # First turn: system prompt + user message
+        system_prompt = _assemble_system_prompt(emad_config, model_name)
+        messages = []
+        if system_prompt:
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(new_user_msg)
 
         return {
-            "messages": lc_messages,
+            "messages": messages,
             "conversation_id": conv_id,
             "iteration_count": 0,
             "injected_domain_ids": set(),
