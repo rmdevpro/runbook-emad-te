@@ -326,6 +326,7 @@ def build_graph(params: dict):
                 "injected_domain_ids": set(),
             }
 
+        inner_config["recursion_limit"] = 100  # Runbook agents need many tool calls
         result = await compiled_inner.ainvoke(inner_input, config=inner_config)
 
         return {
