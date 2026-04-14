@@ -122,6 +122,14 @@ async def llm_call_node(state: ReactState) -> dict:
     tool_names = list(tool_config.keys())
     active_tools = get_tools_for_model(model_name, tool_names)
 
+    # Add MCP tools if configured (e.g., Hymie desktop automation)
+    mcp_config = emad_config.get("mcp_tools", {})
+    if mcp_config:
+        from runbook_emad_te.mcp_tools import load_mcp_tools_sync
+
+        mcp_tools = load_mcp_tools_sync(mcp_config)
+        active_tools = list(active_tools) + mcp_tools
+
     if active_tools:
         llm_with_tools = llm.bind_tools(active_tools)
     else:
@@ -206,6 +214,31 @@ def build_graph(params: dict):
 
     # ── Build inner ReAct graph with checkpointer ────────────────────
     all_tools = list(TOOL_REGISTRY.values())
+
+    # Scan eMAD configs for MCP tools and add them to the ToolNode
+    # so it can execute them when the LLM calls them.
+    if os.path.isdir(_EMADS_DIR):
+        from runbook_emad_te.mcp_tools import load_mcp_tools_sync
+
+        seen_servers = set()
+        for name in os.listdir(_EMADS_DIR):
+            cfg_path = os.path.join(_EMADS_DIR, name, "config.json")
+            if os.path.isfile(cfg_path):
+                try:
+                    with open(cfg_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    for srv_name, srv_cfg in cfg.get("mcp_tools", {}).items():
+                        url = srv_cfg.get("url", "")
+                        if url and url not in seen_servers:
+                            seen_servers.add(url)
+                            mcp_tools = load_mcp_tools_sync(
+                                {srv_name: {"url": url}}  # Load ALL tools from server
+                            )
+                            all_tools.extend(mcp_tools)
+                            _log.info("Loaded %d MCP tools from %s", len(mcp_tools), srv_name)
+                except (OSError, json.JSONDecodeError) as exc:
+                    _log.warning("Failed to read eMAD config %s: %s", cfg_path, exc)
+
     tool_node_instance = ToolNode(all_tools) if all_tools else None
 
     inner = StateGraph(ReactState)

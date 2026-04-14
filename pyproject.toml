@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "runbook-emad-te"
-version = "0.2.0"
+version = "0.3.0"
 description = "Runbook-driven eMAD TE — universal task agent with configurable tools and identity"
 requires-python = ">=3.12"
 dependencies = [
     "langgraph>=0.2.60",
     "langchain-core>=0.3.28",
     "langchain-openai>=0.2.14",
+    "httpx>=0.27.2",
 ]
 
 [tool.setuptools.packages.find]

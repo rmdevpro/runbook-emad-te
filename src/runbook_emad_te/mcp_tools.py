@@ -1,0 +1,150 @@
+"""
+MCP tool wrapper — creates LangChain tools from a remote MCP server.
+
+eMAD configs can declare mcp_tools to pull tools from external MCP servers
+(e.g., Hymie for desktop automation). These tools are NOT in the AE registry —
+they're TE-specific and only loaded for eMADs that need them.
+
+Config format in config.json:
+    "mcp_tools": {
+        "hymie2": {
+            "url": "http://192.168.1.132:9223/mcp",
+            "tools": ["desktop_click", "desktop_type", "desktop_screenshot"]
+        }
+    }
+
+If "tools" is empty or absent, all tools from the server are loaded.
+"""
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+import httpx
+from langchain_core.tools import StructuredTool
+
+_log = logging.getLogger("runbook_emad_te.mcp_tools")
+
+_ACCEPT_HEADER = "application/json, text/event-stream"
+
+
+async def _mcp_call(url: str, method: str, params: dict | None = None) -> dict:
+    """Call an MCP server method and return the result."""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params or {},
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": _ACCEPT_HEADER,
+            },
+        )
+        resp.raise_for_status()
+
+        # Handle SSE response format
+        text = resp.text
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+
+        # Try plain JSON
+        return resp.json()
+
+
+async def _list_mcp_tools(url: str) -> list[dict]:
+    """Get tool definitions from an MCP server."""
+    # Initialize first
+    await _mcp_call(url, "initialize", {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "runbook-emad-te", "version": "1.0"},
+    })
+    result = await _mcp_call(url, "tools/list")
+    return result.get("result", {}).get("tools", [])
+
+
+def _make_mcp_tool(server_url: str, tool_def: dict) -> StructuredTool:
+    """Create a LangChain StructuredTool from an MCP tool definition."""
+    name = tool_def["name"]
+    description = tool_def.get("description", f"MCP tool: {name}")
+    schema = tool_def.get("inputSchema", {"type": "object", "properties": {}})
+
+    async def _call_tool(**kwargs: Any) -> str:
+        result = await _mcp_call(server_url, "tools/call", {
+            "name": name,
+            "arguments": kwargs,
+        })
+        content = result.get("result", {}).get("content", [])
+        parts = []
+        for item in content:
+            if item.get("type") == "text":
+                parts.append(item.get("text", ""))
+            elif item.get("type") == "image":
+                parts.append(f"[image: {item.get('mimeType', 'image/png')}]")
+            else:
+                parts.append(str(item))
+        return "\n".join(parts) if parts else str(result)
+
+    return StructuredTool.from_function(
+        coroutine=_call_tool,
+        name=name,
+        description=description,
+        args_schema=None,
+    )
+
+
+def load_mcp_tools_sync(mcp_config: dict) -> list[StructuredTool]:
+    """Load MCP tools from config. Called at graph build time.
+
+    Args:
+        mcp_config: Dict of server_name -> {url, tools} from eMAD config.
+
+    Returns:
+        List of LangChain StructuredTool instances.
+    """
+    tools = []
+
+    for server_name, server_cfg in mcp_config.items():
+        url = server_cfg.get("url", "")
+        if not url:
+            _log.warning("MCP server '%s' has no URL, skipping", server_name)
+            continue
+
+        allowed = set(server_cfg.get("tools", []))
+
+        try:
+            # Run async in sync context (build_graph is sync)
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    tool_defs = pool.submit(
+                        asyncio.run, _list_mcp_tools(url)
+                    ).result(timeout=30)
+            else:
+                tool_defs = asyncio.run(_list_mcp_tools(url))
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
+            _log.error("Failed to list tools from MCP server '%s' at %s: %s",
+                       server_name, url, exc)
+            continue
+
+        for tool_def in tool_defs:
+            name = tool_def["name"]
+            if allowed and name not in allowed:
+                continue
+            try:
+                tool = _make_mcp_tool(url, tool_def)
+                tools.append(tool)
+                _log.info("Loaded MCP tool: %s from %s", name, server_name)
+            except (ValueError, TypeError) as exc:
+                _log.warning("Failed to create tool '%s' from %s: %s",
+                             name, server_name, exc)
+
+    return tools
