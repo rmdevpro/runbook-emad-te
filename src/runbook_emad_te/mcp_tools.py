@@ -19,14 +19,48 @@ If "tools" is empty or absent, all tools from the server are loaded.
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field, create_model
 
 _log = logging.getLogger("runbook_emad_te.mcp_tools")
 
 _ACCEPT_HEADER = "application/json, text/event-stream"
+
+# JSON Schema type -> Python type mapping
+_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _schema_to_pydantic(name: str, schema: dict) -> type[BaseModel]:
+    """Convert a JSON Schema to a Pydantic model for LangChain tool binding."""
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    fields = {}
+
+    for prop_name, prop_def in properties.items():
+        python_type = _TYPE_MAP.get(prop_def.get("type", "string"), str)
+        description = prop_def.get("description", "")
+        default = prop_def.get("default")
+
+        if prop_name in required:
+            fields[prop_name] = (python_type, Field(description=description))
+        else:
+            fields[prop_name] = (
+                Optional[python_type],
+                Field(default=default, description=description),
+            )
+
+    model_name = f"MCP_{name}_Args"
+    return create_model(model_name, **fields)
 
 
 async def _mcp_call(url: str, method: str, params: dict | None = None) -> dict:
@@ -60,7 +94,6 @@ async def _mcp_call(url: str, method: str, params: dict | None = None) -> dict:
 
 async def _list_mcp_tools(url: str) -> list[dict]:
     """Get tool definitions from an MCP server."""
-    # Initialize first
     await _mcp_call(url, "initialize", {
         "protocolVersion": "2024-11-05",
         "capabilities": {},
@@ -74,12 +107,18 @@ def _make_mcp_tool(server_url: str, tool_def: dict) -> StructuredTool:
     """Create a LangChain StructuredTool from an MCP tool definition."""
     name = tool_def["name"]
     description = tool_def.get("description", f"MCP tool: {name}")
-    schema = tool_def.get("inputSchema", {"type": "object", "properties": {}})
+    input_schema = tool_def.get("inputSchema", {"type": "object", "properties": {}})
+
+    # Build Pydantic model from the MCP input schema so the LLM
+    # knows exactly what parameters the tool accepts
+    args_model = _schema_to_pydantic(name, input_schema)
 
     async def _call_tool(**kwargs: Any) -> str:
+        # Remove None values (optional params not provided)
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
         result = await _mcp_call(server_url, "tools/call", {
             "name": name,
-            "arguments": kwargs,
+            "arguments": clean_kwargs,
         })
         content = result.get("result", {}).get("content", [])
         parts = []
@@ -96,7 +135,7 @@ def _make_mcp_tool(server_url: str, tool_def: dict) -> StructuredTool:
         coroutine=_call_tool,
         name=name,
         description=description,
-        args_schema=None,
+        args_schema=args_model,
     )
 
 
@@ -120,7 +159,6 @@ def load_mcp_tools_sync(mcp_config: dict) -> list[StructuredTool]:
         allowed = set(server_cfg.get("tools", []))
 
         try:
-            # Run async in sync context (build_graph is sync)
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 import concurrent.futures
