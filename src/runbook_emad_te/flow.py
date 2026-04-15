@@ -25,8 +25,11 @@ from typing_extensions import TypedDict
 
 _log = logging.getLogger("runbook_emad_te.flow")
 
-_MAX_ITERATIONS = 20  # Runbook agents may need more steps than conversational agents
+_MAX_ITERATIONS = 40  # Runbook agents with many tools need more steps
 _EMADS_DIR = "/emads"
+
+# Module-level MCP tool cache: server_url -> list of tools
+_mcp_tool_cache: dict[str, list] = {}
 
 
 def _load_emad_config(model_name: str) -> dict:
@@ -79,6 +82,35 @@ def _assemble_system_prompt(emad_config: dict, model_name: str) -> str:
     return "\n".join(parts)
 
 
+def _get_mcp_tools(mcp_config: dict) -> list:
+    """Get MCP tools, cached per server URL to avoid re-fetching every call."""
+    if not mcp_config:
+        return []
+
+    all_tools = []
+    for server_name, server_cfg in mcp_config.items():
+        url = server_cfg.get("url", "")
+        if not url:
+            continue
+        allowed = set(server_cfg.get("tools", []))
+
+        if url in _mcp_tool_cache:
+            cached = _mcp_tool_cache[url]
+            if allowed:
+                all_tools.extend([t for t in cached if t.name in allowed])
+            else:
+                all_tools.extend(cached)
+        else:
+            from runbook_emad_te.mcp_tools import load_mcp_tools_sync
+            loaded = load_mcp_tools_sync({server_name: {"url": url}})
+            _mcp_tool_cache[url] = loaded
+            if allowed:
+                all_tools.extend([t for t in loaded if t.name in allowed])
+            else:
+                all_tools.extend(loaded)
+    return all_tools
+
+
 # ── Inner ReAct graph state ──────────────────────────────────────────
 
 
@@ -96,6 +128,37 @@ class ReactState(TypedDict):
 # ── Inner ReAct graph nodes ──────────────────────────────────────────
 
 
+def _fix_orphan_tool_calls(messages: list) -> list:
+    """Fix messages with orphan tool_calls (no matching tool response).
+
+    This happens when max_iterations fires after an AI message with tool_calls
+    but before the tool responses are added. OpenAI rejects this state.
+    We add synthetic "cancelled" tool responses for any unanswered tool_calls.
+    """
+    fixed = list(messages)
+    # Find the last AI message with tool_calls
+    for i in range(len(fixed) - 1, -1, -1):
+        msg = fixed[i]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            # Check if every tool_call has a matching ToolMessage after it
+            call_ids = {tc["id"] for tc in msg.tool_calls}
+            for j in range(i + 1, len(fixed)):
+                if isinstance(fixed[j], ToolMessage):
+                    call_ids.discard(fixed[j].tool_call_id)
+            # Add synthetic responses for orphans
+            if call_ids:
+                _log.warning("Fixing %d orphan tool_calls in message history", len(call_ids))
+                insert_at = i + 1
+                for call_id in call_ids:
+                    fixed.insert(insert_at, ToolMessage(
+                        content="[Tool call cancelled — iteration limit reached]",
+                        tool_call_id=call_id,
+                    ))
+                    insert_at += 1
+            break  # Only fix the most recent set
+    return fixed
+
+
 async def llm_call_node(state: ReactState) -> dict:
     """Call the LLM with configured tools."""
     model_name = state.get("model_name", "unknown")
@@ -107,13 +170,18 @@ async def llm_call_node(state: ReactState) -> dict:
     from langchain_openai import ChatOpenAI
 
     api_key = get_api_key(llm_config)
-    llm = ChatOpenAI(
-        base_url=llm_config.get("base_url"),
-        model=llm_config.get("model", "gpt-4o-mini"),
-        api_key=api_key or "not-needed",
-        temperature=llm_config.get("temperature", 0.3),
-        timeout=1800,
-    )
+    kwargs = {
+        "base_url": llm_config.get("base_url"),
+        "model": llm_config.get("model", "gpt-4o-mini"),
+        "api_key": api_key or "not-needed",
+        "timeout": 1800,
+    }
+    # Only set temperature if the model supports it
+    temp = llm_config.get("temperature")
+    if temp is not None:
+        kwargs["temperature"] = temp
+
+    llm = ChatOpenAI(**kwargs)
 
     # Get tools from AE registry, filtered by eMAD config
     from app.tools import get_tools_for_model
@@ -122,12 +190,10 @@ async def llm_call_node(state: ReactState) -> dict:
     tool_names = list(tool_config.keys())
     active_tools = get_tools_for_model(model_name, tool_names)
 
-    # Add MCP tools if configured (e.g., Hymie desktop automation)
+    # Add MCP tools (cached — not re-fetched every call)
     mcp_config = emad_config.get("mcp_tools", {})
-    if mcp_config:
-        from runbook_emad_te.mcp_tools import load_mcp_tools_sync
-
-        mcp_tools = load_mcp_tools_sync(mcp_config)
+    mcp_tools = _get_mcp_tools(mcp_config)
+    if mcp_tools:
         active_tools = list(active_tools) + mcp_tools
 
     if active_tools:
@@ -135,7 +201,8 @@ async def llm_call_node(state: ReactState) -> dict:
     else:
         llm_with_tools = llm
 
-    messages = list(state["messages"])
+    # Fix any orphan tool_calls from previous iterations
+    messages = _fix_orphan_tool_calls(list(state["messages"]))
 
     _log.info("Runbook eMAD %s LLM call: %d messages, %d tools",
                model_name, len(messages), len(active_tools))
@@ -175,12 +242,25 @@ def should_continue(state: ReactState) -> str:
 
 
 async def max_iterations_fallback(state: ReactState) -> dict:
-    return {
-        "messages": [AIMessage(content=(
-            "I was unable to complete the runbook within the allowed "
-            "number of steps. The task may need to be broken into smaller parts."
-        ))],
-    }
+    """Handle max iterations — add synthetic tool responses for pending calls."""
+    messages = state.get("messages", [])
+    new_messages = []
+
+    # Find the last AI message with tool_calls and add synthetic responses
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                new_messages.append(ToolMessage(
+                    content="[Tool call cancelled — iteration limit reached]",
+                    tool_call_id=tc["id"],
+                ))
+            break
+
+    new_messages.append(AIMessage(content=(
+        "I was unable to complete the runbook within the allowed "
+        "number of steps. The task may need to be broken into smaller parts."
+    )))
+    return {"messages": new_messages}
 
 
 def extract_response(state: ReactState) -> dict:
@@ -204,11 +284,7 @@ class OuterState(TypedDict):
 
 
 def build_graph(params: dict):
-    """Build the runbook eMAD as an outer graph wrapping a checkpointed ReAct subgraph.
-
-    Outer graph: resolves conversation_id, assembles system prompt, invokes subgraph
-    Inner graph: ReAct loop with tools, checkpointed via PostgresSaver
-    """
+    """Build the runbook eMAD as an outer graph wrapping a checkpointed ReAct subgraph."""
     from app.tools import TOOL_REGISTRY
     from app.checkpointer import get_checkpointer
 
@@ -216,10 +292,7 @@ def build_graph(params: dict):
     all_tools = list(TOOL_REGISTRY.values())
 
     # Scan eMAD configs for MCP tools and add them to the ToolNode
-    # so it can execute them when the LLM calls them.
     if os.path.isdir(_EMADS_DIR):
-        from runbook_emad_te.mcp_tools import load_mcp_tools_sync
-
         seen_servers = set()
         for name in os.listdir(_EMADS_DIR):
             cfg_path = os.path.join(_EMADS_DIR, name, "config.json")
@@ -231,9 +304,7 @@ def build_graph(params: dict):
                         url = srv_cfg.get("url", "")
                         if url and url not in seen_servers:
                             seen_servers.add(url)
-                            mcp_tools = load_mcp_tools_sync(
-                                {srv_name: {"url": url}}  # Load ALL tools from server
-                            )
+                            mcp_tools = _get_mcp_tools({srv_name: {"url": url}})
                             all_tools.extend(mcp_tools)
                             _log.info("Loaded %d MCP tools from %s", len(mcp_tools), srv_name)
                 except (OSError, json.JSONDecodeError) as exc:
@@ -326,7 +397,7 @@ def build_graph(params: dict):
                 "injected_domain_ids": set(),
             }
 
-        inner_config["recursion_limit"] = 100  # Runbook agents need many tool calls
+        inner_config["recursion_limit"] = 150  # Runbook agents need many tool calls
         result = await compiled_inner.ainvoke(inner_input, config=inner_config)
 
         return {
