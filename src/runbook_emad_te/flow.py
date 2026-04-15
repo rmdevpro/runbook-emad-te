@@ -8,6 +8,7 @@ TE packages receive a TEContext from the AE — no direct app.* imports.
 ARCH-05: ReAct loop is graph edges, not a while loop inside a node.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import time
 import uuid
 from typing import Annotated, Any, Optional
 
+import httpx
 import openai
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
@@ -109,7 +111,7 @@ def _resolve_tools_for_model(context: Any, model_name: str, _cache: dict = {}) -
     if model_name in _cache:
         return _cache[model_name]
 
-    emad_config = _load_emad_config(model_name)
+    emad_config = _load_emad_config(model_name)  # sync OK — cached after first call
 
     # Get AE tools via context (no app.* import)
     tool_config = emad_config.get("tools", {})
@@ -193,7 +195,7 @@ def build_graph(context):
 
     async def llm_call_node(state: ReactState) -> dict:
         model_name = state.get("model_name", "unknown")
-        emad_config = _load_emad_config(model_name)
+        emad_config = await asyncio.to_thread(_load_emad_config, model_name)
         verbose = emad_config.get("verbose_tracing", False)
 
         llm_config = emad_config.get("llm", {})
@@ -288,7 +290,7 @@ def build_graph(context):
 
     async def dynamic_tool_node(state: ReactState) -> dict:
         model_name = state.get("model_name", "unknown")
-        emad_config = _load_emad_config(model_name)
+        emad_config = await asyncio.to_thread(_load_emad_config, model_name)
         verbose = emad_config.get("verbose_tracing", False)
 
         active_tools = _resolve_tools_for_model(context, model_name)
@@ -315,7 +317,7 @@ def build_graph(context):
                     content = await tool_fn.ainvoke(tool_args)
                     if not isinstance(content, str):
                         content = str(content)
-                except Exception as exc:
+                except (ValueError, TypeError, RuntimeError, OSError, httpx.HTTPError) as exc:
                     content = f"ERROR: Tool '{tool_name}' failed: {exc}. Do not retry with same arguments."
                     _log.error("Tool %s failed: %s", tool_name, exc)
 
@@ -375,8 +377,8 @@ def build_graph(context):
         elif not conv_id:
             conv_id = f"default-{model_name}"
 
-        emad_config = _load_emad_config(model_name)
-        system_prompt = _assemble_system_prompt(emad_config, model_name)
+        emad_config = await asyncio.to_thread(_load_emad_config, model_name)
+        system_prompt = await asyncio.to_thread(_assemble_system_prompt, emad_config, model_name)
 
         raw_messages = payload.get("messages", [])
         new_user_msg = None
