@@ -116,11 +116,32 @@ def _make_mcp_tool(server_url: str, tool_def: dict) -> StructuredTool:
     async def _call_tool(**kwargs: Any) -> str:
         # Remove None values (optional params not provided)
         clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        result = await _mcp_call(server_url, "tools/call", {
-            "name": name,
-            "arguments": clean_kwargs,
-        })
-        content = result.get("result", {}).get("content", [])
+        try:
+            result = await _mcp_call(server_url, "tools/call", {
+                "name": name,
+                "arguments": clean_kwargs,
+            })
+        except (httpx.HTTPError, OSError, RuntimeError) as exc:
+            # FIX bug #4: Structured error instead of opaque failure
+            return f"ERROR: MCP tool '{name}' call failed: {exc}. Do not retry with the same arguments."
+
+        # Check for JSON-RPC error
+        if "error" in result:
+            err = result["error"]
+            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            return f"ERROR: MCP tool '{name}' returned error: {msg}. Do not retry with the same arguments."
+
+        mcp_result = result.get("result", {})
+
+        # Check if the tool itself reported an error
+        if mcp_result.get("isError"):
+            content = mcp_result.get("content", [])
+            err_text = " ".join(
+                item.get("text", "") for item in content if item.get("type") == "text"
+            )
+            return f"ERROR: Tool '{name}' failed: {err_text}. Do not retry with the same arguments."
+
+        content = mcp_result.get("content", [])
         parts = []
         for item in content:
             if item.get("type") == "text":
@@ -129,7 +150,7 @@ def _make_mcp_tool(server_url: str, tool_def: dict) -> StructuredTool:
                 parts.append(f"[image: {item.get('mimeType', 'image/png')}]")
             else:
                 parts.append(str(item))
-        return "\n".join(parts) if parts else str(result)
+        return "\n".join(parts) if parts else "OK (no output)"
 
     return StructuredTool.from_function(
         coroutine=_call_tool,

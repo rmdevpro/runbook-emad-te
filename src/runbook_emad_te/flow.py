@@ -13,6 +13,7 @@ ARCH-05: ReAct loop is graph edges, not a while loop inside a node.
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Annotated, Optional
 
@@ -25,15 +26,15 @@ from typing_extensions import TypedDict
 
 _log = logging.getLogger("runbook_emad_te.flow")
 
-_MAX_ITERATIONS = 40  # Runbook agents with many tools need more steps
+_MAX_ITERATIONS = 40
 _EMADS_DIR = "/emads"
 
-# Module-level MCP tool cache: server_url -> list of tools
+# Module-level caches
 _mcp_tool_cache: dict[str, list] = {}
+_active_tools_cache: dict[str, list] = {}  # model_name -> resolved tool list
 
 
 def _load_emad_config(model_name: str) -> dict:
-    """Load the eMAD's config.json from /emads/{model_name}/."""
     config_path = os.path.join(_EMADS_DIR, model_name, "config.json")
     try:
         with open(config_path, encoding="utf-8") as f:
@@ -44,7 +45,6 @@ def _load_emad_config(model_name: str) -> dict:
 
 
 def _load_runbook(model_name: str, runbook_filename: str) -> str:
-    """Load the runbook markdown from the eMAD's directory."""
     runbook_path = os.path.join(_EMADS_DIR, model_name, runbook_filename)
     try:
         with open(runbook_path, encoding="utf-8") as f:
@@ -55,13 +55,11 @@ def _load_runbook(model_name: str, runbook_filename: str) -> str:
 
 
 def _assemble_system_prompt(emad_config: dict, model_name: str) -> str:
-    """Assemble system prompt from identity + purpose + runbook."""
     identity = emad_config.get("identity", "You are a task agent.")
     purpose = emad_config.get("purpose", "Execute assigned tasks.")
     runbook_file = emad_config.get("runbook", "runbook.md")
     runbook_text = _load_runbook(model_name, runbook_file)
 
-    # Load platform knowledge files if present
     knowledge_dir = os.path.join(_EMADS_DIR, model_name, "platform-knowledge")
     platform_knowledge = ""
     if os.path.isdir(knowledge_dir):
@@ -83,7 +81,7 @@ def _assemble_system_prompt(emad_config: dict, model_name: str) -> str:
 
 
 def _get_mcp_tools(mcp_config: dict) -> list:
-    """Get MCP tools, cached per server URL to avoid re-fetching every call."""
+    """Get MCP tools, cached per server URL."""
     if not mcp_config:
         return []
 
@@ -111,60 +109,55 @@ def _get_mcp_tools(mcp_config: dict) -> list:
     return all_tools
 
 
+def _resolve_tools_for_model(model_name: str) -> list:
+    """Single source of truth for tool resolution. Used by BOTH
+    the LLM (bind_tools) and the ToolNode (execution).
+
+    FIX for bug #2: LLM and ToolNode were using different tool sets.
+    """
+    if model_name in _active_tools_cache:
+        return _active_tools_cache[model_name]
+
+    emad_config = _load_emad_config(model_name)
+
+    from app.tools import get_tools_for_model
+
+    tool_config = emad_config.get("tools", {})
+    tool_names = list(tool_config.keys())
+    active_tools = list(get_tools_for_model(model_name, tool_names))
+
+    mcp_config = emad_config.get("mcp_tools", {})
+    mcp_tools = _get_mcp_tools(mcp_config)
+    if mcp_tools:
+        active_tools.extend(mcp_tools)
+
+    _active_tools_cache[model_name] = active_tools
+    _log.info("Resolved %d tools for model %s", len(active_tools), model_name)
+    return active_tools
+
+
 # ── Inner ReAct graph state ──────────────────────────────────────────
 
 
 class ReactState(TypedDict):
-    """State for the inner ReAct subgraph (checkpointed)."""
-
     messages: Annotated[list[AnyMessage], add_messages]
     response_text: Optional[str]
     error: Optional[str]
     iteration_count: int
-    injected_domain_ids: set  # Dedup set for domain knowledge injection
+    injected_domain_ids: set
     model_name: str
 
 
 # ── Inner ReAct graph nodes ──────────────────────────────────────────
 
 
-def _fix_orphan_tool_calls(messages: list) -> list:
-    """Fix messages with orphan tool_calls (no matching tool response).
-
-    This happens when max_iterations fires after an AI message with tool_calls
-    but before the tool responses are added. OpenAI rejects this state.
-    We add synthetic "cancelled" tool responses for any unanswered tool_calls.
-    """
-    fixed = list(messages)
-    # Find the last AI message with tool_calls
-    for i in range(len(fixed) - 1, -1, -1):
-        msg = fixed[i]
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            # Check if every tool_call has a matching ToolMessage after it
-            call_ids = {tc["id"] for tc in msg.tool_calls}
-            for j in range(i + 1, len(fixed)):
-                if isinstance(fixed[j], ToolMessage):
-                    call_ids.discard(fixed[j].tool_call_id)
-            # Add synthetic responses for orphans
-            if call_ids:
-                _log.warning("Fixing %d orphan tool_calls in message history", len(call_ids))
-                insert_at = i + 1
-                for call_id in call_ids:
-                    fixed.insert(insert_at, ToolMessage(
-                        content="[Tool call cancelled — iteration limit reached]",
-                        tool_call_id=call_id,
-                    ))
-                    insert_at += 1
-            break  # Only fix the most recent set
-    return fixed
-
-
 async def llm_call_node(state: ReactState) -> dict:
     """Call the LLM with configured tools."""
     model_name = state.get("model_name", "unknown")
     emad_config = _load_emad_config(model_name)
+    verbose = emad_config.get("verbose_tracing", False)
 
-    # Get LLM from eMAD config
+    # Get LLM
     llm_config = emad_config.get("llm", {})
     from app.config import get_api_key
     from langchain_openai import ChatOpenAI
@@ -176,54 +169,74 @@ async def llm_call_node(state: ReactState) -> dict:
         "api_key": api_key or "not-needed",
         "timeout": 1800,
     }
-    # Only set temperature if the model supports it
     temp = llm_config.get("temperature")
     if temp is not None:
         kwargs["temperature"] = temp
 
     llm = ChatOpenAI(**kwargs)
 
-    # Get tools from AE registry, filtered by eMAD config
-    from app.tools import get_tools_for_model
-
-    tool_config = emad_config.get("tools", {})
-    tool_names = list(tool_config.keys())
-    active_tools = get_tools_for_model(model_name, tool_names)
-
-    # Add MCP tools (cached — not re-fetched every call)
-    mcp_config = emad_config.get("mcp_tools", {})
-    mcp_tools = _get_mcp_tools(mcp_config)
-    if mcp_tools:
-        active_tools = list(active_tools) + mcp_tools
+    # FIX bug #2: Use single tool resolution for both LLM and ToolNode
+    active_tools = _resolve_tools_for_model(model_name)
 
     if active_tools:
         llm_with_tools = llm.bind_tools(active_tools)
     else:
         llm_with_tools = llm
 
-    # Fix any orphan tool_calls from previous iterations
-    messages = _fix_orphan_tool_calls(list(state["messages"]))
+    messages = list(state["messages"])
 
-    _log.info("Runbook eMAD %s LLM call: %d messages, %d tools",
-               model_name, len(messages), len(active_tools))
+    # FIX bug #3: Fix orphan tool_calls AND persist the fixes to state
+    orphan_fixes = []
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            call_ids = {tc["id"] for tc in msg.tool_calls}
+            for j in range(i + 1, len(messages)):
+                if isinstance(messages[j], ToolMessage):
+                    call_ids.discard(messages[j].tool_call_id)
+            if call_ids:
+                _log.warning("Fixing %d orphan tool_calls", len(call_ids))
+                for call_id in call_ids:
+                    fix_msg = ToolMessage(
+                        content="[Tool call cancelled — previous turn limit reached]",
+                        tool_call_id=call_id,
+                    )
+                    orphan_fixes.append(fix_msg)
+                    messages.insert(i + 1, fix_msg)
+            break
 
+    iteration = state.get("iteration_count", 0)
+    _log.info("Runbook eMAD %s LLM call: %d messages, %d tools, iteration %d/%d",
+               model_name, len(messages), len(active_tools), iteration, _MAX_ITERATIONS)
+
+    t0 = time.monotonic()
     try:
         response = await llm_with_tools.ainvoke(messages)
     except (openai.APIError, ValueError, RuntimeError, OSError) as exc:
         _log.error("Runbook eMAD %s LLM call failed: %s", model_name, exc)
         return {
-            "messages": [AIMessage(content="I encountered an error processing the task.")],
+            "messages": orphan_fixes + [AIMessage(content=f"I encountered an error: {exc}")],
             "error": str(exc),
         }
+    llm_ms = int((time.monotonic() - t0) * 1000)
 
+    # Verbose tracing
+    if verbose:
+        tool_calls = response.tool_calls if hasattr(response, 'tool_calls') else []
+        tool_names = [tc.get("name", "?") for tc in tool_calls] if tool_calls else []
+        _log.info("TRACE %s iter=%d llm_ms=%d tool_calls=%s content_len=%d",
+                   model_name, iteration, llm_ms,
+                   tool_names or "none",
+                   len(response.content) if response.content else 0)
+
+    result_messages = orphan_fixes + [response]
     return {
-        "messages": [response],
-        "iteration_count": state.get("iteration_count", 0) + 1,
+        "messages": result_messages,
+        "iteration_count": iteration + 1,
     }
 
 
 def should_continue(state: ReactState) -> str:
-    """Route: tool_node if tool calls, else extract_response."""
     if state.get("error"):
         return "extract_response"
 
@@ -242,11 +255,9 @@ def should_continue(state: ReactState) -> str:
 
 
 async def max_iterations_fallback(state: ReactState) -> dict:
-    """Handle max iterations — add synthetic tool responses for pending calls."""
     messages = state.get("messages", [])
     new_messages = []
 
-    # Find the last AI message with tool_calls and add synthetic responses
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
@@ -263,8 +274,62 @@ async def max_iterations_fallback(state: ReactState) -> dict:
     return {"messages": new_messages}
 
 
+async def _dynamic_tool_node(state: ReactState) -> dict:
+    """Custom tool execution node that uses the SAME tool set as the LLM.
+
+    FIX for bug #2: Replaces static ToolNode which had a different tool set.
+    """
+    model_name = state.get("model_name", "unknown")
+    emad_config = _load_emad_config(model_name)
+    verbose = emad_config.get("verbose_tracing", False)
+
+    active_tools = _resolve_tools_for_model(model_name)
+    tool_map = {t.name: t for t in active_tools}
+
+    messages = state.get("messages", [])
+    last = messages[-1]
+    if not isinstance(last, AIMessage) or not last.tool_calls:
+        return {"messages": []}
+
+    result_messages = []
+    for tc in last.tool_calls:
+        tool_name = tc["name"]
+        tool_args = tc.get("args", {})
+        call_id = tc["id"]
+
+        t0 = time.monotonic()
+        tool_fn = tool_map.get(tool_name)
+        if tool_fn is None:
+            # FIX bug #4: Clear error instead of opaque failure
+            content = f"ERROR: Tool '{tool_name}' is not available. Available tools: {sorted(tool_map.keys())}"
+            _log.warning("Tool not found: %s (available: %s)", tool_name, sorted(tool_map.keys()))
+        else:
+            try:
+                content = await tool_fn.ainvoke(tool_args)
+                if not isinstance(content, str):
+                    content = str(content)
+            except Exception as exc:
+                # FIX bug #4: Structured error instead of raw JSON-RPC
+                content = f"ERROR: Tool '{tool_name}' failed: {exc}. Do not retry with the same arguments."
+                _log.error("Tool %s failed: %s", tool_name, exc)
+
+        tool_ms = int((time.monotonic() - t0) * 1000)
+
+        if verbose:
+            _log.info("TRACE %s tool=%s ms=%d args=%s result_len=%d",
+                       model_name, tool_name, tool_ms,
+                       json.dumps(tool_args)[:200],
+                       len(content))
+
+        result_messages.append(ToolMessage(
+            content=content,
+            tool_call_id=call_id,
+        ))
+
+    return {"messages": result_messages}
+
+
 def extract_response(state: ReactState) -> dict:
-    """Extract final response text from the last AI message."""
     for msg in reversed(state.get("messages", [])):
         if isinstance(msg, AIMessage) and msg.content:
             return {"response_text": str(msg.content)}
@@ -285,57 +350,30 @@ class OuterState(TypedDict):
 
 def build_graph(params: dict):
     """Build the runbook eMAD as an outer graph wrapping a checkpointed ReAct subgraph."""
-    from app.tools import TOOL_REGISTRY
     from app.checkpointer import get_checkpointer
 
     # ── Build inner ReAct graph with checkpointer ────────────────────
-    all_tools = list(TOOL_REGISTRY.values())
-
-    # Scan eMAD configs for MCP tools and add them to the ToolNode
-    if os.path.isdir(_EMADS_DIR):
-        seen_servers = set()
-        for name in os.listdir(_EMADS_DIR):
-            cfg_path = os.path.join(_EMADS_DIR, name, "config.json")
-            if os.path.isfile(cfg_path):
-                try:
-                    with open(cfg_path, encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    for srv_name, srv_cfg in cfg.get("mcp_tools", {}).items():
-                        url = srv_cfg.get("url", "")
-                        if url and url not in seen_servers:
-                            seen_servers.add(url)
-                            mcp_tools = _get_mcp_tools({srv_name: {"url": url}})
-                            all_tools.extend(mcp_tools)
-                            _log.info("Loaded %d MCP tools from %s", len(mcp_tools), srv_name)
-                except (OSError, json.JSONDecodeError) as exc:
-                    _log.warning("Failed to read eMAD config %s: %s", cfg_path, exc)
-
-    tool_node_instance = ToolNode(all_tools) if all_tools else None
+    # FIX bug #2: Use _dynamic_tool_node instead of static ToolNode.
+    # The dynamic node resolves tools per model_name at runtime,
+    # ensuring LLM and executor use the same tool set.
 
     inner = StateGraph(ReactState)
     inner.add_node("llm_call_node", llm_call_node)
+    inner.add_node("tool_node", _dynamic_tool_node)
     inner.add_node("extract_response", extract_response)
     inner.add_node("max_iterations_fallback", max_iterations_fallback)
 
-    if tool_node_instance:
-        inner.add_node("tool_node", tool_node_instance)
-
     inner.set_entry_point("llm_call_node")
-
-    if tool_node_instance:
-        inner.add_conditional_edges(
-            "llm_call_node",
-            should_continue,
-            {
-                "tool_node": "tool_node",
-                "max_iterations_fallback": "max_iterations_fallback",
-                "extract_response": "extract_response",
-            },
-        )
-        inner.add_edge("tool_node", "llm_call_node")
-    else:
-        inner.add_edge("llm_call_node", "extract_response")
-
+    inner.add_conditional_edges(
+        "llm_call_node",
+        should_continue,
+        {
+            "tool_node": "tool_node",
+            "max_iterations_fallback": "max_iterations_fallback",
+            "extract_response": "extract_response",
+        },
+    )
+    inner.add_edge("tool_node", "llm_call_node")
     inner.add_edge("max_iterations_fallback", "extract_response")
     inner.add_edge("extract_response", END)
 
@@ -346,11 +384,9 @@ def build_graph(params: dict):
     # ── Build outer graph — no checkpointer, just preprocessing ──────
 
     async def resolve_and_invoke(state: OuterState) -> dict:
-        """Parse payload, resolve thread_id, invoke inner subgraph."""
         payload = state.get("payload", {})
         model_name = payload.get("model", "unknown")
 
-        # Resolve conversation_id -> thread_id
         conv_id = payload.get("conversation_id", "")
         if conv_id == "new":
             conv_id = str(uuid.uuid4())
@@ -358,11 +394,9 @@ def build_graph(params: dict):
         elif not conv_id:
             conv_id = f"default-{model_name}"
 
-        # Load eMAD config and assemble system prompt
         emad_config = _load_emad_config(model_name)
         system_prompt = _assemble_system_prompt(emad_config, model_name)
 
-        # Extract the last user message from payload
         raw_messages = payload.get("messages", [])
         new_user_msg = None
         for m in reversed(raw_messages):
@@ -372,20 +406,18 @@ def build_graph(params: dict):
         if not new_user_msg:
             new_user_msg = HumanMessage(content="")
 
-        # Invoke inner subgraph with thread_id config
         inner_config = {"configurable": {"thread_id": conv_id}}
 
-        # Check if this is a resumed thread (prior messages in checkpointer)
         checkpoint = await cp.aget_tuple(inner_config)
         if checkpoint and checkpoint.checkpoint.get("channel_values", {}).get("messages"):
-            # Resumed — just send new user message + model_name
             _log.info("Resuming conversation %s for %s", conv_id, model_name)
             inner_input = {
                 "messages": [new_user_msg],
                 "model_name": model_name,
+                "iteration_count": 0,  # FIX bug #1: Reset per turn
+                "error": None,         # FIX: Reset stale error state
             }
         else:
-            # New thread — send system prompt + user message
             _log.info("Starting new conversation %s for %s", conv_id, model_name)
             messages = []
             if system_prompt:
@@ -394,10 +426,12 @@ def build_graph(params: dict):
             inner_input = {
                 "messages": messages,
                 "model_name": model_name,
+                "iteration_count": 0,
+                "error": None,
                 "injected_domain_ids": set(),
             }
 
-        inner_config["recursion_limit"] = 150  # Runbook agents need many tool calls
+        inner_config["recursion_limit"] = 150
         result = await compiled_inner.ainvoke(inner_input, config=inner_config)
 
         return {
@@ -410,5 +444,4 @@ def build_graph(params: dict):
     outer.set_entry_point("resolve_and_invoke")
     outer.add_edge("resolve_and_invoke", END)
 
-    # Outer graph has NO checkpointer — it's stateless
     return outer.compile()
