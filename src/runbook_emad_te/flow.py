@@ -106,25 +106,26 @@ def _get_mcp_tools(mcp_config: dict) -> list:
     return all_tools
 
 
-def _resolve_tools_for_model(context: Any, model_name: str, _cache: dict = {}) -> list:
+_resolve_tools_cache: dict = {}
+
+
+async def _resolve_tools_for_model(context: Any, model_name: str) -> list:
     """Single source of truth for tool resolution."""
-    if model_name in _cache:
-        return _cache[model_name]
+    if model_name in _resolve_tools_cache:
+        return _resolve_tools_cache[model_name]
 
-    emad_config = _load_emad_config(model_name)  # sync OK — cached after first call
+    emad_config = await asyncio.to_thread(_load_emad_config, model_name)
 
-    # Get AE tools via context (no app.* import)
     tool_config = emad_config.get("tools", {})
     tool_names = list(tool_config.keys())
     active_tools = list(context.get_tools_for_model(model_name, tool_names))
 
-    # Add MCP tools
     mcp_config = emad_config.get("mcp_tools", {})
     mcp_tools = _get_mcp_tools(mcp_config)
     if mcp_tools:
         active_tools.extend(mcp_tools)
 
-    _cache[model_name] = active_tools
+    _resolve_tools_cache[model_name] = active_tools
     _log.info("Resolved %d tools for model %s", len(active_tools), model_name)
     return active_tools
 
@@ -201,7 +202,7 @@ def build_graph(context):
         llm_config = emad_config.get("llm", {})
         llm = context.get_chat_model(llm_config)
 
-        active_tools = _resolve_tools_for_model(context, model_name)
+        active_tools = await _resolve_tools_for_model(context, model_name)
 
         if active_tools:
             llm_with_tools = llm.bind_tools(active_tools)
@@ -293,7 +294,7 @@ def build_graph(context):
         emad_config = await asyncio.to_thread(_load_emad_config, model_name)
         verbose = emad_config.get("verbose_tracing", False)
 
-        active_tools = _resolve_tools_for_model(context, model_name)
+        active_tools = await _resolve_tools_for_model(context, model_name)
         tool_map = {t.name: t for t in active_tools}
 
         messages = state.get("messages", [])
